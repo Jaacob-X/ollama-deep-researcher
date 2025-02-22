@@ -1,16 +1,51 @@
 import json
-
+import os
 from typing_extensions import Literal
-
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
+from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama
 from langgraph.graph import START, END, StateGraph
 
-from assistant.configuration import Configuration, SearchAPI
-from assistant.utils import deduplicate_and_format_sources, tavily_search, format_sources, perplexity_search, duckduckgo_search
+from assistant.configuration import Configuration, SearchAPI, LLMProvider
+from assistant.utils import deduplicate_and_format_sources, tavily_search, format_sources, perplexity_search, duckduckgo_search, searxng_search
 from assistant.state import SummaryState, SummaryStateInput, SummaryStateOutput
 from assistant.prompts import query_writer_instructions, summarizer_instructions, reflection_instructions
+
+def get_llm(config: Configuration, json_mode: bool = False):
+    if config.llm_provider == "ollama":
+        return ChatOllama(
+            base_url="http://host.docker.internal:11434/",
+            model=config.ollama_model,
+            temperature=0,
+            format="json" if json_mode else None
+        )
+    else:
+        api_key = ""
+        base_url = ""
+        match config.llm_provider:
+            case "openai":
+                api_key = os.getenv("OPENAI_API_KEY")
+                base_url = "https://api.openai.com/v1"
+            case "gemini":
+                api_key = os.getenv("GEMINI_API_KEY")
+                base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+            case "deepseek":
+                api_key = os.getenv("DEEPSEEK_API_KEY")
+                base_url = "https://api.deepseek.com/v1"
+            case _:
+                raise ValueError("Unknown LLM provider")
+
+        llm = ChatOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            model=config.api_model,
+            temperature=0
+        )
+        if json_mode and config.api_model != "deepseek-reasoner":
+            # Deepseek-reasoner does not support json_object response_format
+            llm.model_kwargs = {"response_format": {"type": "json_object"}}
+        return llm
 
 # Nodes
 def generate_query(state: SummaryState, config: RunnableConfig):
@@ -21,8 +56,8 @@ def generate_query(state: SummaryState, config: RunnableConfig):
 
     # Generate a query
     configurable = Configuration.from_runnable_config(config)
-    llm_json_mode = ChatOllama(base_url=configurable.ollama_base_url, model=configurable.local_llm, temperature=0, format="json")
-    result = llm_json_mode.invoke(
+    llm = get_llm(configurable, json_mode=True)
+    result = llm.invoke(
         [SystemMessage(content=query_writer_instructions_formatted),
         HumanMessage(content=f"Generate a query for web search:")]
     )
@@ -54,6 +89,9 @@ def web_research(state: SummaryState, config: RunnableConfig):
     elif search_api == "duckduckgo":
         search_results = duckduckgo_search(state.search_query, max_results=3, fetch_full_page=configurable.fetch_full_page)
         search_str = deduplicate_and_format_sources(search_results, max_tokens_per_source=1000, include_raw_content=True)
+    elif search_api == "searxng":
+        search_results = searxng_search(state.search_query, max_results=3)
+        search_str = deduplicate_and_format_sources(search_results, max_tokens_per_source=1000, include_raw_content=True)
     else:
         raise ValueError(f"Unsupported search API: {configurable.search_api}")
 
@@ -83,7 +121,16 @@ def summarize_sources(state: SummaryState, config: RunnableConfig):
 
     # Run the LLM
     configurable = Configuration.from_runnable_config(config)
-    llm = ChatOllama(base_url=configurable.ollama_base_url, model=configurable.local_llm, temperature=0)
+    if configurable.summary_with_r1: 
+        llm = ChatOpenAI(
+            api_key=os.environ.get("DEEPSEEK_API_KEY"),
+            base_url="https://api.deepseek.com/v1",
+            model="deepseek-reasoner",
+            temperature=0
+        )
+    else:
+        llm = get_llm(configurable, json_mode=False)
+        
     result = llm.invoke(
         [SystemMessage(content=summarizer_instructions),
         HumanMessage(content=human_message_content)]
@@ -105,8 +152,8 @@ def reflect_on_summary(state: SummaryState, config: RunnableConfig):
 
     # Generate a query
     configurable = Configuration.from_runnable_config(config)
-    llm_json_mode = ChatOllama(base_url=configurable.ollama_base_url, model=configurable.local_llm, temperature=0, format="json")
-    result = llm_json_mode.invoke(
+    llm = get_llm(configurable, json_mode=True)
+    result = llm.invoke(
         [SystemMessage(content=reflection_instructions.format(research_topic=state.research_topic)),
         HumanMessage(content=f"Identify a knowledge gap and generate a follow-up web search query based on our existing knowledge: {state.running_summary}")]
     )

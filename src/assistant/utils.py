@@ -4,6 +4,7 @@ from typing import Dict, Any, List, Optional
 from langsmith import traceable
 from tavily import TavilyClient
 from duckduckgo_search import DDGS
+from langchain_community.utilities import SearxSearchWrapper
 
 def deduplicate_and_format_sources(search_response, max_tokens_per_source, include_raw_content=False):
     """
@@ -91,7 +92,10 @@ def duckduckgo_search(query: str, max_results: int = 3, fetch_full_page: bool = 
     try:
         with DDGS() as ddgs:
             results = []
-            search_results = list(ddgs.text(query, max_results=max_results))
+            search_results = list(ddgs.text(query, 
+                                            max_results=max_results,
+                                            region = 'zh-cn'),
+                                            time='m2')
             
             for r in search_results:
                 url = r.get('href')
@@ -149,7 +153,7 @@ def tavily_search(query, include_raw_content=True, max_results=3):
                 - content (str): Snippet/summary of the content
                 - raw_content (str): Full content of the page if available"""
      
-    tavily_client = TavilyClient()
+    tavily_client = TavilyClient(api_key=os.environ['TAVILY_API_KEY'])
     return tavily_client.search(query, 
                          max_results=max_results, 
                          include_raw_content=include_raw_content)
@@ -223,3 +227,50 @@ def perplexity_search(query: str, perplexity_search_loop_count: int) -> Dict[str
         })
     
     return {"results": results}
+
+@traceable
+def searxng_search(query: str, max_results: int = 3, searx_host: Optional[str] = "http://host.docker.internal:8080") -> Dict[str, List[Dict[str, str]]]:
+    """Search the web using SearxNG.
+    
+    Args:
+        query (str): The search query to execute
+        max_results (int): Maximum number of results to return
+        searx_host (str, optional): The SearxNG instance host URL. If None, uses SEARXNG_HOST env variable
+        
+    Returns:
+        dict: Search response containing:
+            - results (list): List of search result dictionaries, each containing:
+                - title (str): Title of the search result
+                - url (str): URL of the search result
+                - content (str): Snippet/summary of the content
+                - raw_content (str): Same as content since SearxNG doesn't provide full page content
+    """
+    try:
+        # Initialize SearxNG wrapper
+        searx = SearxSearchWrapper(searx_host=searx_host, unsecure=True)
+        
+        # Get search results
+        raw_results = searx.results(query, num_results=max_results, languages=['zh'], time_range='month')
+        
+        # Format results to match other search functions
+        results = []
+        for r in raw_results:
+            result = {
+                "title": r.get("title", ""),
+                "url": r.get("link", ""),
+                "content": r.get("snippet", ""),
+                "raw_content": r.get("snippet", "")  # SearxNG doesn't provide full content
+            }
+            
+            # Only add if we have all required fields
+            if all([result["title"], result["url"], result["content"]]):
+                results.append(result)
+            else:
+                print(f"Warning: Incomplete result from SearxNG: {r}")
+        
+        return {"results": results}
+        
+    except Exception as e:
+        print(f"Error in SearxNG search: {str(e)}")
+        print(f"Full error details: {type(e).__name__}")
+        return {"results": []}
