@@ -29,12 +29,12 @@
 
 Clone the repo and build an image:
 ```
-$ docker build -t LLM-Web-Search .
+$ docker build -t ollama-deep-researcher .
 ```
 
 Run the container:
 ```
-$ docker run --rm -it -p 2024:2024 LLM-Web-Search
+$ docker run --rm -it -p 2024:2024 ollama-deep-researcher
 ```
 
 NOTE: You will see log message:
